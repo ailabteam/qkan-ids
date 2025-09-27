@@ -7,7 +7,6 @@ from tqdm import tqdm
 import numpy as np
 import joblib
 
-from kan import KAN
 from dataset import IntrusionDataset, get_feature_dim
 
 # --- Cấu hình ---
@@ -30,35 +29,53 @@ MODEL_SAVE_DIR.mkdir(exist_ok=True)
 INPUT_DIM = get_feature_dim()
 ENCODING_DIMS = [64, 32]
 BOTTLECK_DIM = 16
-NUM_EPOCHS = 10 
+NUM_EPOCHS = 15 
 BATCH_SIZE = 1024
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CLIP_VALUE = 5.0 
 
-# --- Mô hình KAN Autoencoder ---
-class KANAutoencoder(nn.Module):
+# --- Mô hình MLP Autoencoder ---
+class MLPAutoencoder(nn.Module):
     def __init__(self, input_dim, encoding_dims, bottleneck_dim):
         super().__init__()
         if input_dim <= 0:
             raise ValueError("Input dimension must be positive.")
         
-        encoder_layers = [input_dim] + encoding_dims + [bottleneck_dim]
-        decoder_layers = encoder_layers[::-1]
-        
-        print(f"KAN Encoder Architecture: {encoder_layers}")
-        print(f"KAN Decoder Architecture: {decoder_layers}")
-        
-        self.encoder = KAN(width=encoder_layers, grid=5, k=3, device=DEVICE)
-        self.decoder = KAN(width=decoder_layers, grid=5, k=3, device=DEVICE)
+        # --- Encoder ---
+        encoder_layers = []
+        in_features = input_dim
+        all_dims = encoding_dims + [bottleneck_dim]
+        for i, out_features in enumerate(all_dims):
+            encoder_layers.append(nn.Linear(in_features, out_features))
+            # Không thêm ReLU ở lớp cuối cùng của encoder
+            if i < len(all_dims) - 1:
+                encoder_layers.append(nn.ReLU())
+            in_features = out_features
+        self.encoder = nn.Sequential(*encoder_layers)
+        print(f"MLP Encoder built: {self.encoder}")
+
+        # --- Decoder ---
+        decoder_layers = []
+        # Đảo ngược kiến trúc
+        dec_dims = [input_dim] + encoding_dims
+        dec_dims = dec_dims[::-1]
+        in_features = bottleneck_dim
+        for i, out_features in enumerate(dec_dims):
+            decoder_layers.append(nn.Linear(in_features, out_features))
+            # Không thêm ReLU ở lớp cuối cùng của decoder
+            if i < len(dec_dims) - 1:
+                decoder_layers.append(nn.ReLU())
+            in_features = out_features
+        self.decoder = nn.Sequential(*decoder_layers)
+        print(f"MLP Decoder built: {self.decoder}")
 
     def forward(self, x):
-        x = torch.clamp(x, -CLIP_VALUE, CLIP_VALUE)
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
 
-# --- Vòng lặp Huấn luyện ---
+# --- Các hàm train_one_epoch và validate_one_epoch ---
+# (Đây là các hàm tiêu chuẩn, copy y hệt từ các file train trước)
 def train_one_epoch(model, dataloader, optimizer, criterion):
     model.train()
     total_loss = 0.0
@@ -68,18 +85,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion):
         targets = targets.to(DEVICE)
         reconstructions = model(inputs)
         loss = criterion(reconstructions, targets)
-        if torch.isnan(loss):
-            print("Warning: NaN loss detected. Skipping batch.")
-            continue
+        if torch.isnan(loss): continue
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item()
         progress_bar.set_postfix({"loss": f"{loss.item():.6f}"})
     return total_loss / len(dataloader)
 
-# --- Vòng lặp Đánh giá ---
 @torch.no_grad()
 def validate_one_epoch(model, dataloader, criterion):
     model.eval()
@@ -90,8 +103,7 @@ def validate_one_epoch(model, dataloader, criterion):
         targets = targets.to(DEVICE)
         reconstructions = model(inputs)
         loss = criterion(reconstructions, targets)
-        if not torch.isnan(loss):
-            total_loss += loss.item()
+        if not torch.isnan(loss): total_loss += loss.item()
     return total_loss / len(dataloader)
 
 
@@ -99,11 +111,10 @@ def validate_one_epoch(model, dataloader, criterion):
 def main():
     if INPUT_DIM <= 0: return
 
-    print(f"--- Training KAN Autoencoder Baseline ---")
+    print(f"--- Training MLP Autoencoder Baseline ---")
     print(f"Using device: {DEVICE}")
     print(f"Input feature dimension: {INPUT_DIM}")
     
-    # Datasets và Dataloaders
     full_train_dataset = IntrusionDataset(PROCESSED_DIR, is_train=True)
     train_size = int(0.9 * len(full_train_dataset))
     val_size = len(full_train_dataset) - train_size
@@ -112,13 +123,11 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
     
-    # Khởi tạo mô hình KAN-AE và đẩy lên thiết bị
-    model = KANAutoencoder(INPUT_DIM, ENCODING_DIMS, BOTTLECK_DIM).to(DEVICE)
+    model = MLPAutoencoder(INPUT_DIM, ENCODING_DIMS, BOTTLECK_DIM).to(DEVICE)
 
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    # Vòng lặp huấn luyện
     global epoch
     best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
@@ -127,12 +136,11 @@ def main():
         print(f"Epoch {epoch+1}/{NUM_EPOCHS} -> Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model_path = MODEL_SAVE_DIR / "best_kan_autoencoder.pth"
-            # Lưu model trực tiếp, không cần kiểm tra DataParallel
+            model_path = MODEL_SAVE_DIR / "best_mlp_autoencoder.pth"
             torch.save(model.state_dict(), model_path)
             print(f"  -> Val loss improved. Saved model to {model_path}")
 
-    print("\n--- KAN-AE Training complete! ---")
+    print("\n--- MLP-AE Training complete! ---")
 
 if __name__ == '__main__':
     main()
