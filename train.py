@@ -32,9 +32,9 @@ ENCODING_DIMS = [64, 32]
 BOTTLECK_DIM = 16
 NUM_EPOCHS = 5 # Bắt đầu với 5 epochs
 BATCH_SIZE = 1024 # Tăng batch size hơn nữa
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CLIP_VALUE = 10.0 # Giá trị clip cho input (với RobustScaler, dải giá trị có thể lớn hơn)
+CLIP_VALUE = 5.0 # Giá trị clip cho input (với RobustScaler, dải giá trị có thể lớn hơn)
 
 # --- Mô hình QKAN Autoencoder ---
 class QKANAutoencoder(nn.Module):
