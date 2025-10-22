@@ -33,7 +33,7 @@ The project follows a standard machine learning pipeline:
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/qkan-ids.git
+    git clone https://github.com/ailabteam/qkan-ids.git
     cd qkan-ids
     ```
 
