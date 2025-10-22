@@ -23,6 +23,7 @@ from run_experiments_unsw import UNSWDataset # For UNSW-NB15
 from train_qkan_v2 import QKANAutoencoder
 from train_mlp_ae import MLPAutoencoder
 from sklearn.ensemble import IsolationForest
+from dataset import IntrusionDataset, get_feature_dim # For IDS2018
 
 # --- CẤU HÌNH ---
 IDS2018_DIR = Path("./processed_data/")
