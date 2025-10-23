@@ -53,7 +53,7 @@ class QKANAutoencoder(nn.Module):
         self.decoder = QKAN(decoder_layers, num_qlayers=1, device=DEVICE)
 
     def forward(self, x):
-        x = torch.clamp(x, -CLIP_VALUE, CLIP_VALUE)
+        #x = torch.clamp(x, -CLIP_VALUE, CLIP_VALUE)
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
