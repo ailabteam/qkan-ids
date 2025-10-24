@@ -5,80 +5,42 @@ from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 import joblib
+import argparse
+import time
+import sys
 
-from qkan import QKAN
-from dataset import IntrusionDataset, get_feature_dim
+# Import tất cả các thành phần cần thiết từ file utils.py
+from utils import QKANAutoencoder, MLPAutoencoder, IntrusionDataset, UNSWDataset
 
-# --- Cấu hình ---
 def set_seed(seed=42):
+    """Hàm để đảm bảo kết quả có thể tái lặp."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-set_seed(42)
-
-PROCESSED_DIR = Path("./processed_data/")
-MODEL_SAVE_DIR = Path("./models/")
-MODEL_SAVE_DIR.mkdir(exist_ok=True)
-
-# Hyperparameters
-INPUT_DIM = get_feature_dim()
-ENCODING_DIMS = [64, 32]
-BOTTLECK_DIM = 16
-NUM_EPOCHS = 5 # Bắt đầu với 5 epochs
-BATCH_SIZE = 1024 # Tăng batch size hơn nữa
-LEARNING_RATE = 1e-5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CLIP_VALUE = 5.0 # Giá trị clip cho input (với RobustScaler, dải giá trị có thể lớn hơn)
-
-# --- Mô hình QKAN Autoencoder ---
-class QKANAutoencoder(nn.Module):
-    def __init__(self, input_dim, encoding_dims, bottleneck_dim):
-        super().__init__()
-        if input_dim <= 0:
-            raise ValueError("Input dimension must be positive.")
-        
-        encoder_layers = [input_dim] + encoding_dims + [bottleneck_dim]
-        decoder_layers = encoder_layers[::-1]
-        
-        print(f"QKAN Encoder Architecture: {encoder_layers}")
-        print(f"QKAN Decoder Architecture: {decoder_layers}")
-        
-        # num_qlayers=1 cho sự ổn định
-        self.encoder = QKAN(encoder_layers, num_qlayers=1, device=DEVICE)
-        self.decoder = QKAN(decoder_layers, num_qlayers=1, device=DEVICE)
-
-    def forward(self, x):
-        x = torch.clamp(x, -CLIP_VALUE, CLIP_VALUE)
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return decoded
-
-# --- Vòng lặp Huấn luyện ---
-def train_one_epoch(model, dataloader, optimizer, criterion):
+def train_one_epoch(model, dataloader, optimizer, criterion, epoch_num, total_epochs, device):
+    """Hàm cho một epoch huấn luyện."""
     model.train()
     total_loss = 0.0
-    
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1} Training", leave=False)
-    for inputs, targets, _ in progress_bar:
-        inputs = inputs.to(DEVICE)
-        targets = targets.to(DEVICE)
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch_num}/{total_epochs} Training", leave=False)
+    for inputs, _ in progress_bar: # Chỉ cần inputs cho autoencoder
+        inputs = inputs.to(device)
         
+        # Forward pass
         reconstructions = model(inputs)
-        loss = criterion(reconstructions, targets)
+        loss = criterion(reconstructions, inputs) # Loss được tính giữa input và output
         
         if torch.isnan(loss):
-            print("Warning: NaN loss detected. Skipping batch.")
             continue
-            
+        
+        # Backward pass và tối ưu
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         total_loss += loss.item()
@@ -86,67 +48,99 @@ def train_one_epoch(model, dataloader, optimizer, criterion):
         
     return total_loss / len(dataloader)
 
-# --- Vòng lặp Đánh giá ---
 @torch.no_grad()
-def validate_one_epoch(model, dataloader, criterion):
+def validate_one_epoch(model, dataloader, criterion, epoch_num, total_epochs, device):
+    """Hàm cho một epoch validation."""
     model.eval()
     total_loss = 0.0
-    
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1} Validating", leave=False)
-    for inputs, targets, _ in progress_bar:
-        inputs = inputs.to(DEVICE)
-        targets = targets.to(DEVICE)
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch_num}/{total_epochs} Validating", leave=False)
+    for inputs, _ in progress_bar:
+        inputs = inputs.to(device)
         reconstructions = model(inputs)
-        loss = criterion(reconstructions, targets)
-        
+        loss = criterion(reconstructions, inputs)
         if not torch.isnan(loss):
             total_loss += loss.item()
-
     return total_loss / len(dataloader)
 
-# --- Hàm chính ---
-def main():
-    if INPUT_DIM <= 0: return
+# --- HÀM MAIN ĐIỀU PHỐI ---
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Universal Trainer for Autoencoder Models.")
+    parser.add_argument('model_type', type=str, choices=['qkan', 'mlp'], help="Type of model to train.")
+    parser.add_argument('dataset', type=str, choices=['ids2018', 'unsw'], help="Dataset to use.")
+    parser.add_argument('--epochs', type=int, default=15, help="Number of training epochs.")
+    parser.add_argument('--use_clamp', action='store_true', help="Enable input clamping for the QKAN model on specific datasets.")
+    parser.add_argument('--gpu_id', type=int, default=0, help="GPU ID to use.")
+    args = parser.parse_args()
 
-    print(f"Using device: {DEVICE}")
-    print(f"Input feature dimension: {INPUT_DIM}")
+    # --- CẤU HÌNH ---
+    set_seed(42)
+    DEVICE = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
+    MODEL_SAVE_DIR = Path("./models/")
+    MODEL_SAVE_DIR.mkdir(exist_ok=True)
+    BATCH_SIZE = 1024
+    LEARNING_RATE = 1e-4
+
+    print("\n" + "="*50)
+    print(f"Starting Training Run:")
+    print(f"  Model: {args.model_type.upper()}")
+    print(f"  Dataset: {args.dataset.upper()}")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Use Clamp: {args.use_clamp}")
+    print(f"  Device: {DEVICE}")
+    print("="*50 + "\n")
+
+    # --- CHỌN DATASET VÀ MODEL DỰA TRÊN THAM SỐ DÒNG LỆNH ---
+    if args.dataset == 'ids2018':
+        DATA_DIR = Path("./processed_data/")
+        DatasetClass = IntrusionDataset
+        try:
+            input_dim = len(joblib.load(DATA_DIR / 'columns.pkl'))
+        except FileNotFoundError:
+            sys.exit(f"Error: Preprocessed data for {args.dataset.upper()} not found. Please run preprocess_data.py.")
+    elif args.dataset == 'unsw':
+        DATA_DIR = Path("./processed_data_unsw/")
+        DatasetClass = UNSWDataset
+        try:
+            input_dim = len(joblib.load(DATA_DIR / 'columns_unsw.pkl'))
+        except FileNotFoundError:
+            sys.exit(f"Error: Preprocessed data for {args.dataset.upper()} not found. Please run preprocess_unsw.py.")
     
-    # 1. Datasets và Dataloaders
-    full_train_dataset = IntrusionDataset(PROCESSED_DIR, is_train=True)
-    train_size = int(0.9 * len(full_train_dataset))
-    val_size = len(full_train_dataset) - train_size
+    ModelClass = QKANAutoencoder if args.model_type == 'qkan' else MLPAutoencoder
+        
+    # --- CHUẨN BỊ DỮ LIỆU ---
+    full_train_dataset = DatasetClass(DATA_DIR, is_train=True)
+    train_size = int(0.9 * len(full_train_dataset)); val_size = len(full_train_dataset) - train_size
     train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    print(f"Data loaded for {args.dataset.upper()}. Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-
-    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    # --- KHỞI TẠO VÀ HUẤN LUYỆN ---
+    model = ModelClass(input_dim, device=DEVICE, use_clamp=args.use_clamp).to(DEVICE)
+    print(f"Model {model.__class__.__name__} initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
     
-    # 2. Khởi tạo mô hình
-    model = QKANAutoencoder(INPUT_DIM, ENCODING_DIMS, BOTTLECK_DIM).to(DEVICE)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
-
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-    # 3. Huấn luyện
-    global epoch
     best_val_loss = float('inf')
-    for epoch in range(NUM_EPOCHS):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-        val_loss = validate_one_epoch(model, val_loader, criterion)
-        
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} -> Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+    val_loss_history = []
+    start_time = time.time()
+    
+    for epoch in range(args.epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, epoch + 1, args.epochs, DEVICE)
+        val_loss = validate_one_epoch(model, val_loader, criterion, epoch + 1, args.epochs, DEVICE)
+        val_loss_history.append(val_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} -> Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            model_path = MODEL_SAVE_DIR / "best_qkan_autoencoder.pth"
-            torch.save(model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(), model_path)
-            print(f"  -> Val loss improved. Saved model to {model_path}")
-
-    print("\n--- Training complete! ---")
-
-if __name__ == '__main__':
-    main()
+            model_filename = f"best_{args.model_type}_{args.dataset}.pth"
+            torch.save(model.state_dict(), MODEL_SAVE_DIR / model_filename)
+            print(f"  -> Val loss improved. Saved model to {MODEL_SAVE_DIR / model_filename}")
+            
+    end_time = time.time()
+    print(f"\n--- {args.model_type.upper()} on {args.dataset.upper()} Training Complete! (Total time: {(end_time - start_time)/60:.2f} minutes) ---")
+    
+    # --- LƯU LẠI HISTORY ---
+    history_filename = f"{args.model_type}_{args.dataset}_history.joblib"
+    joblib.dump(val_loss_history, MODEL_SAVE_DIR / history_filename)
+    print(f"Saved validation loss history to {MODEL_SAVE_DIR / history_filename}")
