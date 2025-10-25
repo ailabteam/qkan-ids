@@ -13,7 +13,7 @@ This project implements an Intrusion Detection System (IDS) using a Quantum-insp
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/qkan-ids.git
+    git clone https://github.com/ailabteam/qkan-ids.git
     cd qkan-ids
     ```
 
