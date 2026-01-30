@@ -1,35 +1,32 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 from tqdm import tqdm
 import joblib
 import time
+import numpy as np
 
 from qkan import QKAN
 from dataset import IntrusionDataset, get_feature_dim
 
-# --- CẤU HÌNH SIÊU THAM SỐ (Khớp với Paper) ---
+# --- CẤU HÌNH ---
 TRAIN_DATA_PATH = Path("./processed_data_unsw/train.parquet")
 MODEL_SAVE_DIR = Path("./models/")
 MODEL_SAVE_DIR.mkdir(exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 2048 # Tăng lên để tận dụng 4090
+BATCH_SIZE = 2048
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 15
-ENCODING_DIMS = [64, 32]
-BOTTLENECK_DIM = 16
+NUM_EPOCHS = 30
 
-# --- ĐỊNH NGHĨA AUTOENCODER ---
+# --- MÔ HÌNH ---
 class QKANAutoencoder(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        encoder_layers = [input_dim] + ENCODING_DIMS + [BOTTLENECK_DIM]
-        decoder_layers = encoder_layers[::-1]
-        
-        # num_qlayers=1 theo code cũ của bạn
+        encoder_layers = [input_dim, 64, 32, 16]
+        decoder_layers = [16, 32, 64, input_dim]
         self.encoder = QKAN(encoder_layers, num_qlayers=1, device=DEVICE)
         self.decoder = QKAN(decoder_layers, num_qlayers=1, device=DEVICE)
 
@@ -37,63 +34,86 @@ class QKANAutoencoder(nn.Module):
         return self.decoder(self.encoder(x))
 
 def main():
-    print(f"--- STARTING FINAL TRAINING (UNSW-NB15) ---")
+    print(f"--- HUẤN LUYỆN QKAN-AE (UNSW-NB15) - FULL LOGGING ---")
     
-    # 1. Chuẩn bị dữ liệu
-    input_dim = get_feature_dim(TRAIN_DATA_PATH)
-    train_ds = IntrusionDataset(TRAIN_DATA_PATH)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    # 1. Load data và Split 90/10 để có Validation Set "sạch"
+    full_train_ds = IntrusionDataset(TRAIN_DATA_PATH)
+    train_size = int(0.9 * len(full_train_ds))
+    val_size = len(full_train_ds) - train_size
+    train_ds, val_ds = random_split(full_train_ds, [train_size, val_size])
 
-    # 2. Khởi tạo mô hình
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+    input_dim = get_feature_dim(TRAIN_DATA_PATH)
     model = QKANAutoencoder(input_dim).to(DEVICE)
-    
-    # Tối ưu hóa cho 2 card RTX 4090
     if torch.cuda.device_count() > 1:
-        print(f"Sử dụng {torch.cuda.device_count()} GPUs (DataParallel)!")
         model = nn.DataParallel(model)
 
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-    # 3. Vòng lặp huấn luyện
-    history = []
-    start_time = time.time()
+    # 2. Logs lưu trữ
+    history = {'train_loss': [], 'val_loss': []}
+    
+    start_train_time = time.time()
 
     for epoch in range(NUM_EPOCHS):
+        # --- PHASE: TRAINING ---
         model.train()
-        epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        
+        train_epoch_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
         for inputs, _, _ in pbar:
             inputs = inputs.to(DEVICE)
-            
-            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, inputs)
             
-            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
+            train_epoch_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.6f}"})
-        
-        avg_loss = epoch_loss / len(train_loader)
-        history.append(avg_loss)
-        print(f"Epoch {epoch+1} hoàn thành. Average Loss: {avg_loss:.6f}")
 
-    # 4. Lưu kết quả
-    total_time = time.time() - start_time
-    print(f"\nHuấn luyện xong trong {total_time:.2f} giây.")
+        # --- PHASE: VALIDATION ---
+        model.eval()
+        val_epoch_loss = 0
+        with torch.no_grad():
+            for v_inputs, _, _ in val_loader:
+                v_inputs = v_inputs.to(DEVICE)
+                v_outputs = model(v_inputs)
+                v_loss = criterion(v_outputs, v_inputs)
+                val_epoch_loss += v_loss.item()
+
+        avg_train = train_epoch_loss / len(train_loader)
+        avg_val = val_epoch_loss / len(val_loader)
+        
+        history['train_loss'].append(avg_train)
+        history['val_loss'].append(avg_val)
+        
+        print(f"Epoch {epoch+1}: Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f}")
+
+    total_time = time.time() - start_train_time
     
-    # Lưu Model (Lưu weights gốc để tránh lỗi DataParallel khi load)
-    final_model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-    torch.save(final_model_state, MODEL_SAVE_DIR / "best_qkan_unsw_final.pth")
+    # 3. LƯU TRỮ TẤT CẢ LOGS
+    # Lưu weights sạch
+    model_to_save = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save(model_to_save, MODEL_SAVE_DIR / "best_qkan_unsw_final.pth")
     
-    # Lưu history để vẽ biểu đồ hội tụ (Figure 1 của Revision)
-    joblib.dump(history, MODEL_SAVE_DIR / "qkan_unsw_history_final.joblib")
-    print(f"Model và History đã được lưu vào {MODEL_SAVE_DIR}")
+    # Lưu history (phục vụ Figure 1)
+    joblib.dump(history, MODEL_SAVE_DIR / "history_unsw_final.joblib")
+    
+    # Lưu thông tin cấu hình (phục vụ Rebuttal Reviewer 3)
+    config = {
+        'input_dim': input_dim,
+        'batch_size': BATCH_SIZE,
+        'lr': LEARNING_RATE,
+        'epochs': NUM_EPOCHS,
+        'training_time_sec': total_time,
+        'device_used': f"{torch.cuda.device_count()}x RTX 4090"
+    }
+    joblib.dump(config, MODEL_SAVE_DIR / "config_unsw_final.joblib")
+
+    print(f"\n--- XONG! Toàn bộ Logs đã được lưu trong {MODEL_SAVE_DIR} ---")
 
 if __name__ == "__main__":
     main()
